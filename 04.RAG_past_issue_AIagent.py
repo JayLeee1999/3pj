@@ -1,8 +1,9 @@
-# past_issue_rag.py
+# past_issue_rag_auto.py
 
 import os
 import json
 import pandas as pd
+import glob
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
@@ -16,10 +17,29 @@ load_dotenv(override=True)
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "lastproject")
 NAMESPACE = "past_issue"
-NEWS_JSON_PATH = "data2/2025.07.23_12.15.39_BigKinds_current_issues.json"
 PAST_ISSUE_DB_PATH = "data/Past_news.csv"
 
-# 3. 벡터 임베딩 및 벡터스토어
+# 3. 최신 뉴스 파일 자동 선택 함수
+def get_latest_current_issues_file():
+    """최신 current_issues JSON 파일 경로를 자동으로 찾기"""
+    json_files = glob.glob("data2/*_BigKinds_current_issues.json")
+    if not json_files:
+        raise FileNotFoundError("현재이슈 JSON 파일을 찾을 수 없습니다. data2/ 폴더를 확인해주세요.")
+    
+    # 파일 생성 시간을 기준으로 가장 최신 파일 선택
+    latest_file = max(json_files, key=os.path.getctime)
+    print(f"📂 자동 선택된 파일: {latest_file}")
+    return latest_file
+
+# 4. 파일 경로 설정
+try:
+    NEWS_JSON_PATH = get_latest_current_issues_file()
+except FileNotFoundError as e:
+    print(f"❌ 오류: {e}")
+    print("data2/ 폴더에 *_BigKinds_current_issues.json 파일이 있는지 확인해주세요.")
+    exit(1)
+
+# 5. 벡터 임베딩 및 벡터스토어
 embedding = OpenAIEmbeddings(model=EMBEDDING_MODEL)
 vector_store = PineconeVectorStore(
     index_name=INDEX_NAME,
@@ -27,12 +47,12 @@ vector_store = PineconeVectorStore(
     namespace=NAMESPACE
 )
 
-# 4. 과거 이슈 DB 로딩
+# 6. 과거 이슈 DB 로딩
 df = pd.read_csv(PAST_ISSUE_DB_PATH)
 issue_dict = dict(zip(df["Issue_name"], df["Contents"] + "\n\n상세: " + df["Contentes(Spec)"]))
 valid_issue_names = list(df["Issue_name"].unique())
 
-# 5. AI Agent 1: 관련 과거 이슈 후보 추출
+# 7. AI Agent 1: 관련 과거 이슈 후보 추출
 def extract_candidate_past_issues(news_content, issue_list, top_k=10):
     """AI Agent가 뉴스 내용을 보고 관련 가능성이 높은 과거 이슈들을 추출"""
     
@@ -76,7 +96,7 @@ def extract_candidate_past_issues(news_content, issue_list, top_k=10):
     
     return result["candidates"]
 
-# 6. AI Agent 2: 벡터 검색 결과와 AI 후보 결합
+# 8. AI Agent 2: 벡터 검색 결과와 AI 후보 결합
 def combine_and_validate_results(news_content, vector_candidates, ai_candidates, issue_dict):
     """벡터 검색 결과와 AI 후보를 결합하여 최종 관련 과거 이슈 도출"""
     
@@ -126,60 +146,63 @@ def combine_and_validate_results(news_content, vector_candidates, ai_candidates,
     
     return sorted_candidates[:3]  # 상위 3개만 반환
 
-# 7. 뉴스 이슈 로딩 및 분석
-with open(NEWS_JSON_PATH, "r", encoding="utf-8") as f:
-    data = json.load(f)
+# 9. 메인 분석 로직
+def analyze_past_issues():
+    """뉴스 이슈 로딩 및 분석"""
+    # 뉴스 이슈 로딩
+    with open(NEWS_JSON_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-for idx, issue in enumerate(data["issues"]):
-    print(f"\n{'='*80}")
-    print(f"📰 이슈 {idx+1}/10: {issue['제목']}")
-    print(f"{'='*80}")
-    
-    query = f"{issue['제목']}\n{issue['내용']}"
-
-    # Step 1: 벡터 검색으로 후보 추출
-    results = vector_store.similarity_search_with_score(query, k=10)
-    
-    vector_candidates = []
-    for doc, score in results:
-        content = doc.page_content.replace('\ufeff', '').replace('﻿', '')
+    for idx, issue in enumerate(data["issues"]):
+        print(f"\n{'='*80}")
+        print(f"📰 이슈 {idx+1}/10: {issue['제목']}")
+        print(f"{'='*80}")
         
-        if "Issue_name:" in content:
-            lines = content.split("\n")
-            for line in lines:
-                if "Issue_name:" in line:
-                    issue_name = line.replace("Issue_name:", "").strip()
-                    if issue_name in issue_dict:
-                        # 중복 체크
-                        if not any(c["name"] == issue_name for c in vector_candidates):
-                            similarity_percentage = round((1 - score) * 100, 1)
-                            
-                            content_parts = content.split("Contents:")
-                            issue_detail = content_parts[1].strip() if len(content_parts) > 1 else issue_dict[issue_name]
-                            
-                            vector_candidates.append({
-                                "name": issue_name,
-                                "similarity": similarity_percentage,
-                                "description": issue_detail
-                            })
-                    break
+        query = f"{issue['제목']}\n{issue['내용']}"
 
-    # Step 2: AI Agent로 관련 과거 이슈 후보 추출
-    print("🤖 AI Agent가 관련 과거 이슈를 분석 중...")
-    ai_candidates = extract_candidate_past_issues(query, valid_issue_names, top_k=10)
-    
-    # Step 3: 결과 결합 및 검증
-    final_candidates = combine_and_validate_results(query, vector_candidates, ai_candidates, issue_dict)
-    
-    if not final_candidates:
-        print("❌ 관련 과거 이슈를 찾을 수 없습니다.")
-        continue
-    
-    # Step 4: 최종 분석 결과 생성
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    analysis_prompt = ChatPromptTemplate.from_messages([
-        ("system", "너는 과거 이슈와 현재 뉴스의 연관성을 분석하는 전문가야. 정확하고 신뢰성 있는 분석을 제공해야 해."),
-        ("human", """
+        # Step 1: 벡터 검색으로 후보 추출
+        results = vector_store.similarity_search_with_score(query, k=10)
+        
+        vector_candidates = []
+        for doc, score in results:
+            content = doc.page_content.replace('\ufeff', '').replace('﻿', '')
+            
+            if "Issue_name:" in content:
+                lines = content.split("\n")
+                for line in lines:
+                    if "Issue_name:" in line:
+                        issue_name = line.replace("Issue_name:", "").strip()
+                        if issue_name in issue_dict:
+                            # 중복 체크
+                            if not any(c["name"] == issue_name for c in vector_candidates):
+                                similarity_percentage = round((1 - score) * 100, 1)
+                                
+                                content_parts = content.split("Contents:")
+                                issue_detail = content_parts[1].strip() if len(content_parts) > 1 else issue_dict[issue_name]
+                                
+                                vector_candidates.append({
+                                    "name": issue_name,
+                                    "similarity": similarity_percentage,
+                                    "description": issue_detail
+                                })
+                        break
+
+        # Step 2: AI Agent로 관련 과거 이슈 후보 추출
+        print("🤖 AI Agent가 관련 과거 이슈를 분석 중...")
+        ai_candidates = extract_candidate_past_issues(query, valid_issue_names, top_k=10)
+        
+        # Step 3: 결과 결합 및 검증
+        final_candidates = combine_and_validate_results(query, vector_candidates, ai_candidates, issue_dict)
+        
+        if not final_candidates:
+            print("❌ 관련 과거 이슈를 찾을 수 없습니다.")
+            continue
+        
+        # Step 4: 최종 분석 결과 생성
+        llm = ChatOpenAI(model="gpt-4o", temperature=0)
+        analysis_prompt = ChatPromptTemplate.from_messages([
+            ("system", "너는 과거 이슈와 현재 뉴스의 연관성을 분석하는 전문가야. 정확하고 신뢰성 있는 분석을 제공해야 해."),
+            ("human", """
 [현재 이슈 내용]
 {news}
 
@@ -198,31 +221,35 @@ for idx, issue in enumerate(data["issues"]):
 
 **시사점**: 과거 사례를 통해 예상되는 시장 반응이나 투자 전략
 """)
-    ])
-    
-    past_issues_text = "\n".join([
-        f"- {c['name']} (종합점수: {c['final_score']}/10, 벡터유사도: {c['vector_similarity']}%, AI점수: {c['ai_score']}/10)\n"
-        f"  AI 판단 근거: {c['ai_reason']}\n"
-        f"  과거 이슈 내용: {c['description'][:200]}..."
-        for c in final_candidates
-    ])
-    
-    parser = StrOutputParser()
-    analysis_chain = analysis_prompt | llm | parser
-    
-    response = analysis_chain.invoke({
-        "news": query,
-        "past_issues": past_issues_text
-    })
-    
-    print(response)
-    
-    # 디버깅 정보
-    print(f"\n📊 상세 점수:")
-    for i, c in enumerate(final_candidates, 1):
-        print(f"{i}. {c['name']}: 종합{c['final_score']}/10 (벡터 유사도 {c['vector_similarity']}% + AI 분석 점수 {c['ai_score']}/10)")
-    
-    if idx < len(data["issues"]) - 1:
-        print(f"\n{'-'*80}")
+        ])
+        
+        past_issues_text = "\n".join([
+            f"- {c['name']} (종합점수: {c['final_score']}/10, 벡터유사도: {c['vector_similarity']}%, AI점수: {c['ai_score']}/10)\n"
+            f"  AI 판단 근거: {c['ai_reason']}\n"
+            f"  과거 이슈 내용: {c['description'][:200]}..."
+            for c in final_candidates
+        ])
+        
+        parser = StrOutputParser()
+        analysis_chain = analysis_prompt | llm | parser
+        
+        response = analysis_chain.invoke({
+            "news": query,
+            "past_issues": past_issues_text
+        })
+        
+        print(response)
+        
+        # 디버깅 정보
+        print(f"\n📊 상세 점수:")
+        for i, c in enumerate(final_candidates, 1):
+            print(f"{i}. {c['name']}: 종합{c['final_score']}/10 (벡터 유사도 {c['vector_similarity']}% + AI 분석 점수 {c['ai_score']}/10)")
+        
+        if idx < len(data["issues"]) - 1:
+            print(f"\n{'-'*80}")
 
-print(f"\n🎉 총 {len(data['issues'])}개 이슈 분석 완료!")
+    print(f"\n🎉 총 {len(data['issues'])}개 이슈 분석 완료!")
+
+# 10. 메인 실행
+if __name__ == "__main__":
+    analyze_past_issues()
